@@ -30,6 +30,7 @@
 #include <utility>
 #include <limits>
 #include <stdexcept>
+#include <iterator>
 
 namespace spl {
 
@@ -73,12 +74,14 @@ struct slot_map
 	using reverse_iterator = typename std::vector<T>::reverse_iterator;
 	using const_reverse_iterator = typename std::vector<T>::const_reverse_iterator;
 
+	static constexpr std::size_t npos = (std::numeric_limits<std::size_t>::max)();
+
 	constexpr slot_map() = default;
 	constexpr slot_map(std::size_t initial_capacity)
 	{
 		elements.reserve(initial_capacity);
 		indices.reserve(initial_capacity);
-		erased.reserve(initial_capacity);
+		eraser.reserve(initial_capacity);
 	}
 
 	constexpr slot_wrap<T> as_wrap(const slot_handle& key)
@@ -93,65 +96,85 @@ struct slot_map
 	template <typename...Args>
 	constexpr slot_handle emplace_back(Args&&... args)
 	{
-		if (!erased.empty())
-		{
-			slot_handle key;
+		slot_handle handle;
 
-			key.id = erased.back();
-			erased.pop_back();
+		if (free_tail == npos) {
+			handle.id = indices.size();
+			handle.generations = 1;
+			eraser.emplace_back(indices.size());
 
-			index& index = indices[key.id];
+			index& in = indices.emplace_back();
+			in.index = elements.size();
+			in.generations = 1;
 
-			index.index = elements.size();
-			key.generations = index.generations;
 			elements.emplace_back(std::forward<Args>(args)...);
 
-			return key;
+			return handle;
 		}
 
-		slot_handle key;
+		eraser.emplace_back(free_tail);
+		index& in = indices[free_tail];
 
-		key.id = indices.size();
-		key.generations = 0;
-
-		index& index = indices.emplace_back();
-
-		index.index = elements.size();
-		index.generations = 0;
+		handle.id = free_tail;
+		handle.generations = in.generations;
 
 		elements.emplace_back(std::forward<Args>(args)...);
-		return key;
+
+		free_tail = in.index;
+		in.index = elements.size() - 1;
+
+		return handle;
 	}
 
 	constexpr void clear()
 	{
 		elements.clear();
 		indices.clear();
-		erased.clear();
+		eraser.clear();
+	}
+
+	constexpr void erase(iterator pos)
+	{
+		std::size_t erase_index = std::distance(elements.begin(), pos);
+		std::size_t next_free_slot = eraser[erase_index];
+
+		*pos = std::move(elements.back());
+		elements.pop_back();
+
+		eraser[erase_index] = eraser.back();
+		eraser.pop_back();
+
+		index& in = indices[next_free_slot];
+		in.index = free_tail;
+		in.generations++;
+
+		free_tail = next_free_slot;
 	}
 
 	constexpr void erase(const slot_handle& key)
 	{
+		if (key.id >= indices.size())
+			return;
+
 		index& erase_index = indices[key.id];
 
 		if (erase_index.generations != key.generations) {
 			return;
 		}
 
-		// NOTE: I've seen implementations that simply move the last element to the one we're erasing
-		// However I'm not sure I really want to change the order of elements
-		elements.erase(elements.begin() + erase_index.index);
+		std::size_t next_free_slot = key.id;
 
-		for (index& index : indices) {
-			if (index.index > erase_index.index) {
-				--index.index;
-			}
-		}
+		// Swap & pop
+		elements[erase_index.index] = std::move(elements.back());
+		elements.pop_back();
 
-		erase_index.index = (std::numeric_limits<std::size_t>::max)();
+		eraser[erase_index.index] = eraser.back();
+		eraser.pop_back();
+
+		erase_index.index = free_tail;
 		erase_index.generations++;
 
-		erased.emplace_back(key.id);
+		free_tail = next_free_slot;
 	}
 
 	constexpr const T& operator[](const slot_handle& key) const
@@ -206,7 +229,9 @@ private:
 
 	std::vector<T> elements;
 	std::vector<index> indices;
-	std::vector<std::size_t> erased;
+	std::vector<std::size_t> eraser;
+
+	std::size_t free_tail = npos;
 };
 
 template <typename T>
